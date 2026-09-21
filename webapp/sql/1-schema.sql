@@ -92,7 +92,8 @@ CREATE TABLE rides
   created_at            DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT '要求日時',
   updated_at            DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT '状態更新日時',
   PRIMARY KEY (id),
-  KEY rides_chair_id_updated_at_idx (chair_id, updated_at)
+  KEY rides_chair_id_updated_at_idx (chair_id, updated_at),
+  KEY rides_user_id_created_at_idx (user_id, created_at)
 )
   COMMENT = 'ライド情報テーブル';
 
@@ -136,6 +137,7 @@ CREATE TABLE coupons
   discount   INTEGER      NOT NULL COMMENT '割引額',
   created_at DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT '付与日時',
   used_by    VARCHAR(26)  NULL COMMENT 'クーポンが適用されたライドのID',
-  PRIMARY KEY (user_id, code)
+  PRIMARY KEY (user_id, code),
+  KEY coupons_used_by_idx (used_by)
 )
   COMMENT 'クーポンテーブル';
