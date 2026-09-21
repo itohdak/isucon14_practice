@@ -93,7 +93,8 @@ CREATE TABLE rides
   updated_at            DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT '状態更新日時',
   PRIMARY KEY (id),
   KEY rides_chair_id_updated_at_idx (chair_id, updated_at),
-  KEY rides_user_id_created_at_idx (user_id, created_at)
+  KEY rides_user_id_created_at_idx (user_id, created_at),
+  KEY rides_chair_id_created_at_idx (chair_id, created_at)
 )
   COMMENT = 'ライド情報テーブル';
 
