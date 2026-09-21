@@ -32,7 +32,8 @@ CREATE TABLE chairs
   access_token VARCHAR(255) NOT NULL COMMENT 'アクセストークン',
   created_at   DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT '登録日時',
   updated_at   DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT '更新日時',
-  PRIMARY KEY (id)
+  PRIMARY KEY (id),
+  UNIQUE chairs_access_token_idx (access_token)
 )
   COMMENT = '椅子情報テーブル';
 
@@ -90,7 +91,8 @@ CREATE TABLE rides
   evaluation            INTEGER     NULL     COMMENT '評価',
   created_at            DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT '要求日時',
   updated_at            DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT '状態更新日時',
-  PRIMARY KEY (id)
+  PRIMARY KEY (id),
+  KEY rides_chair_id_updated_at_idx (chair_id, updated_at)
 )
   COMMENT = 'ライド情報テーブル';
 
