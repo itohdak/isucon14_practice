@@ -30,11 +30,12 @@ done
 # アプリケーションのビルド
 APP_NAME=isuride
 cd /home/isucon/webapp/go/
+GO=${GO:-/home/isucon/local/golang/bin/go}
 
 if [ -e pgo.pb.gz ]; then
-  go build -o ${APP_NAME} -pgo=pgo.pb.gz
+  ${GO} build -o ${APP_NAME} -pgo=pgo.pb.gz
 else
-  go build -o ${APP_NAME}
+  ${GO} build -o ${APP_NAME}
 fi
 
 # ミドルウェア・Appの再起動

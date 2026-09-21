@@ -29,6 +29,8 @@ webapp/payment_mock/payment_mock
 
 # Runtime and generated files
 bench
+pprotein
+pprotein-agent
 *.log
 *.pid
 __pycache__/
@@ -37,7 +39,10 @@ __pycache__/
 
 # Home directory files not managed for tuning
 .bash_logout
+.bash_history
 .bashrc
+.gitconfig
+.lesshst
 .profile
 .zshrc
 .x
