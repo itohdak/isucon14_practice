@@ -33,7 +33,8 @@ CREATE TABLE chairs
   created_at   DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT '登録日時',
   updated_at   DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT '更新日時',
   PRIMARY KEY (id),
-  UNIQUE chairs_access_token_idx (access_token)
+  UNIQUE chairs_access_token_idx (access_token),
+  KEY chairs_owner_id_idx (owner_id)
 )
   COMMENT = '椅子情報テーブル';
 
