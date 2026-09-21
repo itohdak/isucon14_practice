@@ -35,3 +35,31 @@ gzip -dkc 3-initial-data.sql.gz | mysql -u"$ISUCON_DB_USER" \
 		--host "$ISUCON_DB_HOST" \
 		--port "$ISUCON_DB_PORT" \
 		"$ISUCON_DB_NAME"
+
+mysql -u"$ISUCON_DB_USER" \
+		-p"$ISUCON_DB_PASSWORD" \
+		--host "$ISUCON_DB_HOST" \
+		--port "$ISUCON_DB_PORT" \
+		"$ISUCON_DB_NAME" <<'SQL'
+ALTER TABLE chairs
+  ADD COLUMN total_distance INTEGER NOT NULL DEFAULT 0 COMMENT '累計移動距離',
+  ADD COLUMN total_distance_updated_at DATETIME(6) NULL COMMENT '累計移動距離の最終更新日時';
+
+UPDATE chairs
+LEFT JOIN (
+  SELECT chair_id,
+         SUM(IFNULL(distance, 0)) AS total_distance,
+         MAX(created_at) AS total_distance_updated_at
+  FROM (
+    SELECT chair_id,
+           created_at,
+           ABS(latitude - LAG(latitude) OVER (PARTITION BY chair_id ORDER BY created_at)) +
+           ABS(longitude - LAG(longitude) OVER (PARTITION BY chair_id ORDER BY created_at)) AS distance
+    FROM chair_locations
+  ) tmp
+  GROUP BY chair_id
+) distance_table ON distance_table.chair_id = chairs.id
+SET chairs.total_distance = IFNULL(distance_table.total_distance, 0),
+    chairs.total_distance_updated_at = distance_table.total_distance_updated_at,
+    chairs.updated_at = chairs.updated_at;
+SQL

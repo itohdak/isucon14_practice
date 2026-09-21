@@ -114,12 +114,38 @@ func chairPostCoordinate(w http.ResponseWriter, r *http.Request) {
 
 	chairLocationID := ulid.Make().String()
 	recordedAt := time.Now()
+	prevLocation := &ChairLocation{}
+	prevLocationExists := false
+	if err := tx.GetContext(ctx, prevLocation, `/* api:chairPostCoordinate route:POST /api/chair/coordinate */
+SELECT * FROM chair_locations WHERE chair_id = ? ORDER BY created_at DESC LIMIT 1`, chair.ID); err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+	} else {
+		prevLocationExists = true
+	}
+
 	if _, err := tx.ExecContext(
 		ctx,
 		`/* api:chairPostCoordinate route:POST /api/chair/coordinate */
 INSERT INTO chair_locations (id, chair_id, latitude, longitude, created_at) VALUES (?, ?, ?, ?, ?)`,
 		chairLocationID, chair.ID, req.Latitude, req.Longitude, recordedAt,
 	); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	addedDistance := 0
+	if prevLocationExists {
+		addedDistance = abs(req.Latitude-prevLocation.Latitude) + abs(req.Longitude-prevLocation.Longitude)
+	}
+	if _, err := tx.ExecContext(ctx, `/* api:chairPostCoordinate route:POST /api/chair/coordinate */
+UPDATE chairs
+SET total_distance = total_distance + ?,
+    total_distance_updated_at = ?,
+    updated_at = updated_at
+WHERE id = ?`, addedDistance, recordedAt, chair.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}

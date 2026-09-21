@@ -204,22 +204,11 @@ SELECT chairs.id,
        chairs.is_active,
        chairs.created_at,
        chairs.updated_at,
-       IFNULL(distance_table.total_distance, 0) AS total_distance,
-       distance_table.total_distance_updated_at
+       chairs.total_distance,
+       chairs.total_distance_updated_at
 FROM chairs
-       LEFT JOIN (SELECT chair_id,
-                          SUM(IFNULL(distance, 0)) AS total_distance,
-                          MAX(created_at)          AS total_distance_updated_at
-                   FROM (SELECT chair_locations.chair_id,
-                                chair_locations.created_at,
-                                ABS(chair_locations.latitude - LAG(chair_locations.latitude) OVER (PARTITION BY chair_locations.chair_id ORDER BY chair_locations.created_at)) +
-                                ABS(chair_locations.longitude - LAG(chair_locations.longitude) OVER (PARTITION BY chair_locations.chair_id ORDER BY chair_locations.created_at)) AS distance
-                         FROM chair_locations
-                                INNER JOIN chairs owner_chairs ON owner_chairs.id = chair_locations.chair_id
-                         WHERE owner_chairs.owner_id = ?) tmp
-                   GROUP BY chair_id) distance_table ON distance_table.chair_id = chairs.id
 WHERE chairs.owner_id = ?
-`, owner.ID, owner.ID); err != nil {
+`, owner.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
