@@ -22,26 +22,41 @@ SELECT * FROM rides WHERE chair_id IS NULL ORDER BY created_at LIMIT 1`); err !=
 	}
 
 	matched := &Chair{}
-	empty := false
-	for i := 0; i < 10; i++ {
-		if err := db.GetContext(ctx, matched, "/* api:internalGetMatching route:GET /api/internal/matching */ SELECT * FROM chairs INNER JOIN (SELECT id FROM chairs WHERE is_active = TRUE ORDER BY RAND() LIMIT 1) AS tmp ON chairs.id = tmp.id LIMIT 1"); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				w.WriteHeader(http.StatusNoContent)
-				return
-			}
-			writeError(w, http.StatusInternalServerError, err)
-		}
-
-		if err := db.GetContext(ctx, &empty, "/* api:internalGetMatching route:GET /api/internal/matching */ SELECT COUNT(*) = 0 FROM (SELECT COUNT(chair_sent_at) = 6 AS completed FROM ride_statuses WHERE ride_id IN (SELECT id FROM rides WHERE chair_id = ?) GROUP BY ride_id) is_completed WHERE completed = FALSE", matched.ID); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
+	if err := db.GetContext(ctx, matched, `/* api:internalGetMatching route:GET /api/internal/matching */
+SELECT chairs.*
+FROM chairs
+       INNER JOIN chair_models ON chair_models.name = chairs.model
+       INNER JOIN (
+         SELECT chair_locations.chair_id, chair_locations.latitude, chair_locations.longitude
+         FROM chair_locations
+                INNER JOIN (
+                  SELECT chair_id, MAX(created_at) AS created_at
+                  FROM chair_locations
+                  GROUP BY chair_id
+                ) latest
+                  ON latest.chair_id = chair_locations.chair_id
+                 AND latest.created_at = chair_locations.created_at
+       ) latest_location ON latest_location.chair_id = chairs.id
+WHERE chairs.is_active = TRUE
+  AND NOT EXISTS (
+    SELECT 1
+    FROM rides assigned_rides
+    WHERE assigned_rides.chair_id = chairs.id
+      AND NOT EXISTS (
+        SELECT 1
+        FROM ride_statuses completed_statuses
+        WHERE completed_statuses.ride_id = assigned_rides.id
+          AND completed_statuses.status = 'COMPLETED'
+      )
+  )
+ORDER BY (ABS(latest_location.latitude - ?) + ABS(latest_location.longitude - ?)) / chair_models.speed ASC,
+         chairs.updated_at ASC
+LIMIT 1`, ride.PickupLatitude, ride.PickupLongitude); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		if empty {
-			break
-		}
-	}
-	if !empty {
-		w.WriteHeader(http.StatusNoContent)
+		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 
