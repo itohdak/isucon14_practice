@@ -140,7 +140,32 @@ func postInitialize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	collectPprotein()
+
 	writeJSON(w, http.StatusOK, postInitializeResponse{Language: "go"})
+}
+
+func collectPprotein() {
+	if os.Getenv("PPROTEIN_COLLECT_DISABLED") == "1" {
+		return
+	}
+
+	url := os.Getenv("PPROTEIN_COLLECT_URL")
+	if url == "" {
+		url = "http://s2:9000/api/group/collect"
+	}
+
+	go func() {
+		resp, err := http.Get(url)
+		if err != nil {
+			slog.Warn("failed to start pprotein collection", "url", url, "err", err)
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode >= 400 {
+			slog.Warn("pprotein collection returned error", "url", url, "status", resp.StatusCode)
+		}
+	}()
 }
 
 type Coordinate struct {
