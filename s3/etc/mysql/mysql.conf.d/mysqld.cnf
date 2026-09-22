@@ -78,3 +78,20 @@ long_query_time = 0.0
 max_binlog_size   = 100M
 # binlog_do_db		= include_database_name
 # binlog_ignore_db	= include_database_name
+
+#
+# * Durability/CPU trade-off for benchmark load
+#
+# MySQL 8.0 enables binary logging by default even with no explicit log_bin
+# directive above, so it must be disabled explicitly. There is no
+# replication or point-in-time recovery on this host (the DB is reset via
+# /api/initialize between runs), so the write and per-commit fsync cost of
+# binlogging is pure overhead here. slp/EXPLAIN analysis of s3's slow log
+# showed COMMIT (30k+ calls/run) as the single largest total-time consumer,
+# driven by innodb_flush_log_at_trx_commit=1 doing a redo-log fsync on every
+# commit in addition to the binlog fsync. Relaxing both removes that
+# fsync/scheduling overhead; the only risk is losing the last <=1s of writes
+# if mysqld or the OS crashes mid-benchmark, which is an acceptable trade
+# for a benchmark host with no external durability requirement.
+skip-log-bin
+innodb_flush_log_at_trx_commit = 2
