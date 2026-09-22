@@ -1,24 +1,54 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"net/http"
 )
 
 // このAPIをインスタンス内から一定間隔で叩かせることで、椅子とライドをマッチングさせる
+//
+// A prior attempt looped this up to 20 times per call and caused a
+// catastrophic system-wide overload (many unrelated error categories,
+// benchmark abort) rather than just fixing matching latency — the fixed
+// one-match-per-tick rate was apparently also implicitly throttling total
+// concurrent active-ride load, not only matching speed. This is a much
+// smaller step (3x instead of 20x) to increase throughput gradually and
+// re-measure, rather than assuming more headroom is always better. The
+// matching logic itself — selection order, chair-freeness check — is
+// unchanged; this only repeats it, still strictly sequentially within one
+// goroutine, so it introduces no new concurrency or race window.
+const maxMatchesPerCall = 3
+
 func internalGetMatching(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	for i := 0; i < maxMatchesPerCall; i++ {
+		matched, err := matchOneRide(ctx)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if !matched {
+			break
+		}
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// matchOneRide finds the single oldest unmatched ride and the single best
+// free chair for it, and assigns them. Returns (false, nil) if there is no
+// unmatched ride or no free chair available right now.
+func matchOneRide(ctx context.Context) (bool, error) {
 	// MEMO: 一旦最も待たせているリクエストに適当な空いている椅子マッチさせる実装とする。おそらくもっといい方法があるはず…
 	ride := &Ride{}
 	if err := db.GetContext(ctx, ride, `/* api:internalGetMatching route:GET /api/internal/matching */
 SELECT * FROM rides WHERE chair_id IS NULL ORDER BY created_at LIMIT 1`); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			w.WriteHeader(http.StatusNoContent)
-			return
+			return false, nil
 		}
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		return false, err
 	}
 
 	matched := &Chair{}
@@ -61,17 +91,14 @@ ORDER BY (ABS(latest_location.latitude - ?) + ABS(latest_location.longitude - ?)
          chairs.updated_at ASC
 LIMIT 1`, ride.PickupLatitude, ride.PickupLongitude); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			w.WriteHeader(http.StatusNoContent)
-			return
+			return false, nil
 		}
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		return false, err
 	}
 
 	if _, err := db.ExecContext(ctx, "UPDATE rides SET chair_id = ? WHERE id = ?", matched.ID, ride.ID); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		return false, err
 	}
 
-	w.WriteHeader(http.StatusNoContent)
+	return true, nil
 }
