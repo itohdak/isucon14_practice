@@ -144,8 +144,10 @@ INSERT INTO chair_locations (id, chair_id, latitude, longitude, created_at) VALU
 UPDATE chairs
 SET total_distance = total_distance + ?,
     total_distance_updated_at = ?,
+    latest_latitude = ?,
+    latest_longitude = ?,
     updated_at = updated_at
-WHERE id = ?`, addedDistance, recordedAt, chair.ID); err != nil {
+WHERE id = ?`, addedDistance, recordedAt, req.Latitude, req.Longitude, chair.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}

@@ -52,22 +52,17 @@ SELECT * FROM rides WHERE chair_id IS NULL ORDER BY created_at LIMIT 1`); err !=
 	}
 
 	matched := &Chair{}
+	// Reads chairs.latest_latitude/longitude (denormalized onto the chairs
+	// row by chairPostCoordinate) instead of recomputing "latest location
+	// per chair" via a MAX(created_at)-per-chair derived table on every
+	// matching tick, which repeated the same O(active chairs) work every
+	// call — the same fix applied to appGetNearbyChairs for the same reason.
 	if err := db.GetContext(ctx, matched, `/* api:internalGetMatching route:GET /api/internal/matching */
 SELECT chairs.*
 FROM chairs
        INNER JOIN chair_models ON chair_models.name = chairs.model
-       INNER JOIN (
-         SELECT chair_locations.chair_id, chair_locations.latitude, chair_locations.longitude
-         FROM chair_locations
-                INNER JOIN (
-                  SELECT chair_id, MAX(created_at) AS created_at
-                  FROM chair_locations
-                  GROUP BY chair_id
-                ) latest
-                  ON latest.chair_id = chair_locations.chair_id
-                 AND latest.created_at = chair_locations.created_at
-       ) latest_location ON latest_location.chair_id = chairs.id
 WHERE chairs.is_active = TRUE
+  AND chairs.latest_latitude IS NOT NULL
   -- A chair only counts as free once it has actually been sent the
   -- COMPLETED status for every ride it was assigned (chair_sent_at set),
   -- not merely once COMPLETED has been recorded. chairGetNotification
@@ -87,7 +82,7 @@ WHERE chairs.is_active = TRUE
           AND completed_statuses.chair_sent_at IS NOT NULL
       )
   )
-ORDER BY (ABS(latest_location.latitude - ?) + ABS(latest_location.longitude - ?)) / chair_models.speed ASC,
+ORDER BY (ABS(chairs.latest_latitude - ?) + ABS(chairs.latest_longitude - ?)) / chair_models.speed ASC,
          chairs.updated_at ASC
 LIMIT 1`, ride.PickupLatitude, ride.PickupLongitude); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {

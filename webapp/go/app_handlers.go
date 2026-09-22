@@ -855,26 +855,20 @@ func appGetNearbyChairs(w http.ResponseWriter, r *http.Request) {
 	coordinate := Coordinate{Latitude: lat, Longitude: lon}
 
 	chairs := []nearbyChairRow{}
+	// Reads chairs.latest_latitude/longitude (denormalized onto the chairs
+	// row by chairPostCoordinate) instead of recomputing "latest location
+	// per chair" via a MAX(created_at)-per-chair derived table on every
+	// call, which repeated the same O(active chairs) work on every poll.
 	if err := db.SelectContext(ctx, &chairs, `/* api:appGetNearbyChairs route:GET /api/app/nearby-chairs */
 SELECT chairs.id,
        chairs.name,
        chairs.model,
-       latest_location.latitude,
-       latest_location.longitude
+       chairs.latest_latitude AS latitude,
+       chairs.latest_longitude AS longitude
 FROM chairs
-       INNER JOIN (
-         SELECT chair_locations.chair_id, chair_locations.latitude, chair_locations.longitude
-         FROM chair_locations
-                INNER JOIN (
-                  SELECT chair_id, MAX(created_at) AS created_at
-                  FROM chair_locations
-                  GROUP BY chair_id
-                ) latest
-                  ON latest.chair_id = chair_locations.chair_id
-                 AND latest.created_at = chair_locations.created_at
-       ) latest_location ON latest_location.chair_id = chairs.id
 WHERE chairs.is_active = TRUE
-  AND ABS(latest_location.latitude - ?) + ABS(latest_location.longitude - ?) <= ?
+  AND chairs.latest_latitude IS NOT NULL
+  AND ABS(chairs.latest_latitude - ?) + ABS(chairs.latest_longitude - ?) <= ?
   AND NOT EXISTS (
     SELECT 1
     FROM rides assigned_rides
