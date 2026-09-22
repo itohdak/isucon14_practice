@@ -250,8 +250,11 @@ SELECT * FROM ride_statuses WHERE ride_id = ? AND chair_sent_at IS NULL ORDER BY
 		status = yetSentRideStatus.Status
 	}
 
+	// Users are write-once (never updated after creation), so no other
+	// transaction can conflict with this read; FOR SHARE only adds InnoDB
+	// row-lock bookkeeping cost on this hot polling path.
 	user := &User{}
-	err = tx.GetContext(ctx, user, "/* api:chairGetNotification route:GET /api/chair/notification */ SELECT * FROM users WHERE id = ? FOR SHARE", ride.UserID)
+	err = tx.GetContext(ctx, user, "/* api:chairGetNotification route:GET /api/chair/notification */ SELECT * FROM users WHERE id = ?", ride.UserID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
