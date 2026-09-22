@@ -43,7 +43,9 @@ mysql -u"$ISUCON_DB_USER" \
 		"$ISUCON_DB_NAME" <<'SQL'
 ALTER TABLE chairs
   ADD COLUMN total_distance INTEGER NOT NULL DEFAULT 0 COMMENT '累計移動距離',
-  ADD COLUMN total_distance_updated_at DATETIME(6) NULL COMMENT '累計移動距離の最終更新日時';
+  ADD COLUMN total_distance_updated_at DATETIME(6) NULL COMMENT '累計移動距離の最終更新日時',
+  ADD COLUMN latest_latitude INTEGER NULL COMMENT '直近の緯度',
+  ADD COLUMN latest_longitude INTEGER NULL COMMENT '直近の経度';
 
 UPDATE chairs
 LEFT JOIN (
@@ -59,7 +61,16 @@ LEFT JOIN (
   ) tmp
   GROUP BY chair_id
 ) distance_table ON distance_table.chair_id = chairs.id
+LEFT JOIN (
+  SELECT chair_id, latitude, longitude
+  FROM chair_locations
+  WHERE (chair_id, created_at) IN (
+    SELECT chair_id, MAX(created_at) FROM chair_locations GROUP BY chair_id
+  )
+) latest_location ON latest_location.chair_id = chairs.id
 SET chairs.total_distance = IFNULL(distance_table.total_distance, 0),
     chairs.total_distance_updated_at = distance_table.total_distance_updated_at,
+    chairs.latest_latitude = latest_location.latitude,
+    chairs.latest_longitude = latest_location.longitude,
     chairs.updated_at = chairs.updated_at;
 SQL

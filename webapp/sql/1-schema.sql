@@ -32,14 +32,6 @@ CREATE TABLE chairs
   access_token VARCHAR(255) NOT NULL COMMENT 'アクセストークン',
   created_at   DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT '登録日時',
   updated_at   DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6) COMMENT '更新日時',
-  -- Denormalized latest chair_locations row, maintained transactionally in
-  -- chairPostCoordinate. Avoids recomputing "latest location per chair" via
-  -- a MAX(created_at)-per-chair derived table on every nearby-chairs poll
-  -- and every matching tick, which repeated identical work on every call.
-  -- NULL until the chair has posted at least one coordinate, matching the
-  -- previous behavior where such chairs were excluded via INNER JOIN.
-  latest_latitude  INTEGER NULL COMMENT '直近の緯度',
-  latest_longitude INTEGER NULL COMMENT '直近の経度',
   PRIMARY KEY (id),
   UNIQUE chairs_access_token_idx (access_token),
   KEY chairs_owner_id_idx (owner_id)
