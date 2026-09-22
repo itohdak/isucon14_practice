@@ -38,6 +38,13 @@ FROM chairs
                  AND latest.created_at = chair_locations.created_at
        ) latest_location ON latest_location.chair_id = chairs.id
 WHERE chairs.is_active = TRUE
+  -- A chair only counts as free once it has actually been sent the
+  -- COMPLETED status for every ride it was assigned (chair_sent_at set),
+  -- not merely once COMPLETED has been recorded. chairGetNotification
+  -- always reports on the chair's most-recently-updated ride, so
+  -- assigning a new ride the instant COMPLETED is recorded (but before
+  -- the chair has polled and seen it) would silently strand that
+  -- COMPLETED notification and violate at-least-once delivery.
   AND NOT EXISTS (
     SELECT 1
     FROM rides assigned_rides
@@ -47,6 +54,7 @@ WHERE chairs.is_active = TRUE
         FROM ride_statuses completed_statuses
         WHERE completed_statuses.ride_id = assigned_rides.id
           AND completed_statuses.status = 'COMPLETED'
+          AND completed_statuses.chair_sent_at IS NOT NULL
       )
   )
 ORDER BY (ABS(latest_location.latitude - ?) + ABS(latest_location.longitude - ?)) / chair_models.speed ASC,
