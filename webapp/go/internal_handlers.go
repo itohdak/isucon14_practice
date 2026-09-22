@@ -19,7 +19,11 @@ import (
 // matching logic itself — selection order, chair-freeness check — is
 // unchanged; this only repeats it, still strictly sequentially within one
 // goroutine, so it introduces no new concurrency or race window.
-const maxMatchesPerCall = 3
+//
+// 3 was confirmed stable; this is one more small step up (3 -> 5) now that
+// the db host (s3) has Netdata monitoring wired up to check headroom before
+// and after.
+const maxMatchesPerCall = 5
 
 func internalGetMatching(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
