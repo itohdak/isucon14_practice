@@ -112,7 +112,8 @@ CREATE TABLE ride_statuses
   PRIMARY KEY (id),
   KEY ride_statuses_ride_id_created_at_idx (ride_id, created_at),
   KEY ride_statuses_ride_id_app_sent_at_created_at_idx (ride_id, app_sent_at, created_at),
-  KEY ride_statuses_ride_id_chair_sent_at_created_at_idx (ride_id, chair_sent_at, created_at)
+  KEY ride_statuses_ride_id_chair_sent_at_created_at_idx (ride_id, chair_sent_at, created_at),
+  KEY ride_statuses_ride_id_status_idx (ride_id, status)
 )
   COMMENT = 'ライドステータスの変更履歴テーブル';
 

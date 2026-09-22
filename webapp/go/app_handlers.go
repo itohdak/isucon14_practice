@@ -768,59 +768,34 @@ UPDATE ride_statuses SET app_sent_at = CURRENT_TIMESTAMP(6) WHERE id = ?`, yetSe
 func getChairStats(ctx context.Context, tx *sqlx.Tx, chairID string) (appGetNotificationResponseChairStats, error) {
 	stats := appGetNotificationResponseChairStats{}
 
-	rides := []Ride{}
-	err := tx.SelectContext(
+	// A ride counts toward the chair's stats only once it has recorded ARRIVED,
+	// CARRYING, and COMPLETED statuses (order is not checked, matching the
+	// previous per-ride Go loop this query replaces).
+	var result struct {
+		TotalRidesCount int     `db:"total_rides_count"`
+		TotalEvaluation float64 `db:"total_evaluation"`
+	}
+	err := tx.GetContext(
 		ctx,
-		&rides,
+		&result,
 		`/* api:appGetNotification fn:getChairStats */
-SELECT * FROM rides WHERE chair_id = ? ORDER BY updated_at DESC`,
+SELECT
+  COUNT(*) AS total_rides_count,
+  COALESCE(SUM(r.evaluation), 0) AS total_evaluation
+FROM rides r
+WHERE r.chair_id = ?
+  AND EXISTS (SELECT 1 FROM ride_statuses rs WHERE rs.ride_id = r.id AND rs.status = 'ARRIVED')
+  AND EXISTS (SELECT 1 FROM ride_statuses rs WHERE rs.ride_id = r.id AND rs.status = 'CARRYING')
+  AND EXISTS (SELECT 1 FROM ride_statuses rs WHERE rs.ride_id = r.id AND rs.status = 'COMPLETED')`,
 		chairID,
 	)
 	if err != nil {
 		return stats, err
 	}
 
-	totalRideCount := 0
-	totalEvaluation := 0.0
-	for _, ride := range rides {
-		rideStatuses := []RideStatus{}
-		err = tx.SelectContext(
-			ctx,
-			&rideStatuses,
-			`/* api:appGetNotification fn:getChairStats */
-SELECT * FROM ride_statuses WHERE ride_id = ? ORDER BY created_at`,
-			ride.ID,
-		)
-		if err != nil {
-			return stats, err
-		}
-
-		var arrivedAt, pickupedAt *time.Time
-		var isCompleted bool
-		for _, status := range rideStatuses {
-			if status.Status == "ARRIVED" {
-				arrivedAt = &status.CreatedAt
-			} else if status.Status == "CARRYING" {
-				pickupedAt = &status.CreatedAt
-			}
-			if status.Status == "COMPLETED" {
-				isCompleted = true
-			}
-		}
-		if arrivedAt == nil || pickupedAt == nil {
-			continue
-		}
-		if !isCompleted {
-			continue
-		}
-
-		totalRideCount++
-		totalEvaluation += float64(*ride.Evaluation)
-	}
-
-	stats.TotalRidesCount = totalRideCount
-	if totalRideCount > 0 {
-		stats.TotalEvaluationAvg = totalEvaluation / float64(totalRideCount)
+	stats.TotalRidesCount = result.TotalRidesCount
+	if result.TotalRidesCount > 0 {
+		stats.TotalEvaluationAvg = result.TotalEvaluation / float64(result.TotalRidesCount)
 	}
 
 	return stats, nil
