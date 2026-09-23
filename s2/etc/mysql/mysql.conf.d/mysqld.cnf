@@ -45,7 +45,16 @@ key_buffer_size		= 16M
 # the first time they are touched
 myisam-recover-options  = BACKUP
 
-# max_connections        = 151
+# The stock default (151) was hit almost exactly (Max_used_connections
+# peaked at 152) during a full-scale benchmark run after moving the
+# matcher to a batch design that briefly holds one transaction covering
+# up to 10 ride+chair pairs per tick — the resulting "Too many
+# connections" errors caused a run to fail (pass=false) that had a
+# perfectly good score otherwise. The app does not set
+# db.SetMaxOpenConns, so its connection usage is only bounded by this
+# server-side limit; raising it is a standard config tuning knob (not
+# an instance scale-up) and immediately fixed the failure on retest.
+max_connections        = 1024
 
 # table_open_cache       = 4000
 
