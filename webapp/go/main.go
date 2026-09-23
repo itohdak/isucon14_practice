@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	crand "crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -10,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -19,6 +22,22 @@ import (
 )
 
 var db *sqlx.DB
+
+func isContextDone(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+func isIgnorableSSEError(err error) bool {
+	return isContextDone(err) || strings.Contains(err.Error(), "invalid connection")
+}
+
+func isMySQLRetryable(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	if !errors.As(err, &mysqlErr) {
+		return false
+	}
+	return mysqlErr.Number == 1213 || mysqlErr.Number == 1205
+}
 
 func main() {
 	go standalone.Integrate(":8888")
@@ -82,7 +101,10 @@ func setup() http.Handler {
 		authedMux.HandleFunc("POST /api/app/rides", appPostRides)
 		authedMux.HandleFunc("POST /api/app/rides/estimated-fare", appPostRidesEstimatedFare)
 		authedMux.HandleFunc("POST /api/app/rides/{ride_id}/evaluation", appPostRideEvaluatation)
-		authedMux.HandleFunc("GET /api/app/notification", appGetNotification)
+		// SSE implementation (see isucon14/docs/ISURIDE.md), replacing the
+		// JSON-polling appGetNotification (kept, unregistered, as an easy
+		// revert path: swap this line back if SSE misbehaves).
+		authedMux.HandleFunc("GET /api/app/notification", appGetNotificationSSE)
 		authedMux.HandleFunc("GET /api/app/nearby-chairs", appGetNearbyChairs)
 	}
 
@@ -102,7 +124,8 @@ func setup() http.Handler {
 		authedMux := mux.With(chairAuthMiddleware)
 		authedMux.HandleFunc("POST /api/chair/activity", chairPostActivity)
 		authedMux.HandleFunc("POST /api/chair/coordinate", chairPostCoordinate)
-		authedMux.HandleFunc("GET /api/chair/notification", chairGetNotification)
+		// SSE implementation; see the app-side comment above.
+		authedMux.HandleFunc("GET /api/chair/notification", chairGetNotificationSSE)
 		authedMux.HandleFunc("POST /api/chair/rides/{ride_id}/status", chairPostRideStatus)
 	}
 

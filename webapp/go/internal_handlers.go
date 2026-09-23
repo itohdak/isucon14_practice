@@ -134,8 +134,12 @@ WHERE chairs.is_active = TRUE
 	}
 	assignment := hungarianAssignment(cost)
 
+	matchedChairIDs := make([]string, len(rides))
+	matchedRideIDs := make([]string, len(rides))
 	for i, ride := range rides {
 		chairID := available[assignment[i]].ID
+		matchedChairIDs[i] = chairID
+		matchedRideIDs[i] = ride.ID
 		if _, err := tx.ExecContext(ctx, "UPDATE rides SET chair_id = ? WHERE id = ?", chairID, ride.ID); err != nil {
 			return err
 		}
@@ -144,7 +148,18 @@ WHERE chairs.is_active = TRUE
 		}
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	// Wake both sides' SSE notification loops: chairs were blocked waiting
+	// for a ride, and apps need to learn the chair assignment immediately.
+	for i, chairID := range matchedChairIDs {
+		chairEvents.publish(chairID)
+		rideEvents.publish(matchedRideIDs[i])
+	}
+
+	return nil
 }
 
 // matchCost is the original SQL's ABS(lat-?)+ABS(lon-?))/speed pickup-time

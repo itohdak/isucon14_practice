@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"time"
@@ -37,14 +38,44 @@ func appPostUsers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var lastStatusCode int
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		var result *appPostUsersResponse
+		accessToken := ""
+		var statusCode int
+		var err error
+		result, accessToken, statusCode, err = createAppUser(ctx, req)
+		if err == nil {
+			http.SetCookie(w, &http.Cookie{
+				Path:  "/",
+				Name:  "app_session",
+				Value: accessToken,
+			})
+
+			writeJSON(w, http.StatusCreated, result)
+			return
+		}
+		if statusCode != http.StatusInternalServerError || !isMySQLRetryable(err) {
+			writeError(w, statusCode, err)
+			return
+		}
+		lastStatusCode = statusCode
+		lastErr = err
+		time.Sleep(time.Duration(attempt+1) * 20 * time.Millisecond)
+	}
+
+	writeError(w, lastStatusCode, lastErr)
+}
+
+func createAppUser(ctx context.Context, req *appPostUsersRequest) (*appPostUsersResponse, string, int, error) {
 	userID := ulid.Make().String()
 	accessToken := secureRandomStr(32)
 	invitationCode := secureRandomStr(15)
 
 	tx, err := db.Beginx()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		return nil, "", http.StatusInternalServerError, err
 	}
 	defer tx.Rollback()
 
@@ -54,8 +85,7 @@ func appPostUsers(w http.ResponseWriter, r *http.Request) {
 		userID, req.Username, req.FirstName, req.LastName, req.DateOfBirth, accessToken, invitationCode,
 	)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		return nil, "", http.StatusInternalServerError, err
 	}
 
 	// 初回登録キャンペーンのクーポンを付与
@@ -65,8 +95,7 @@ func appPostUsers(w http.ResponseWriter, r *http.Request) {
 		userID, "CP_NEW2024", 3000,
 	)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		return nil, "", http.StatusInternalServerError, err
 	}
 
 	// 招待コードを使った登録
@@ -75,12 +104,10 @@ func appPostUsers(w http.ResponseWriter, r *http.Request) {
 		var coupons []Coupon
 		err = tx.SelectContext(ctx, &coupons, "SELECT * FROM coupons WHERE code = ? FOR UPDATE", "INV_"+*req.InvitationCode)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
+			return nil, "", http.StatusInternalServerError, err
 		}
 		if len(coupons) >= 3 {
-			writeError(w, http.StatusBadRequest, errors.New("この招待コードは使用できません。"))
-			return
+			return nil, "", http.StatusBadRequest, errors.New("この招待コードは使用できません。")
 		}
 
 		// ユーザーチェック
@@ -88,11 +115,9 @@ func appPostUsers(w http.ResponseWriter, r *http.Request) {
 		err = tx.GetContext(ctx, &inviter, "SELECT * FROM users WHERE invitation_code = ?", *req.InvitationCode)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
-				writeError(w, http.StatusBadRequest, errors.New("この招待コードは使用できません。"))
-				return
+				return nil, "", http.StatusBadRequest, errors.New("この招待コードは使用できません。")
 			}
-			writeError(w, http.StatusInternalServerError, err)
-			return
+			return nil, "", http.StatusInternalServerError, err
 		}
 
 		// 招待クーポン付与
@@ -102,8 +127,7 @@ func appPostUsers(w http.ResponseWriter, r *http.Request) {
 			userID, "INV_"+*req.InvitationCode, 1500,
 		)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
+			return nil, "", http.StatusInternalServerError, err
 		}
 		// 招待した人にもRewardを付与
 		_, err = tx.ExecContext(
@@ -112,26 +136,18 @@ func appPostUsers(w http.ResponseWriter, r *http.Request) {
 			inviter.ID, "RWD_"+*req.InvitationCode, 1000,
 		)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
+			return nil, "", http.StatusInternalServerError, err
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		return nil, "", http.StatusInternalServerError, err
 	}
 
-	http.SetCookie(w, &http.Cookie{
-		Path:  "/",
-		Name:  "app_session",
-		Value: accessToken,
-	})
-
-	writeJSON(w, http.StatusCreated, &appPostUsersResponse{
+	return &appPostUsersResponse{
 		ID:             userID,
 		InvitationCode: invitationCode,
-	})
+	}, accessToken, http.StatusCreated, nil
 }
 
 type appPostPaymentMethodsRequest struct {
@@ -432,6 +448,7 @@ func appPostRides(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	userEvents.publish(user.ID)
 
 	writeJSON(w, http.StatusAccepted, &appPostRidesResponse{
 		RideID: rideID,
@@ -625,6 +642,7 @@ func appPostRideEvaluatation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	rideEvents.publish(rideID)
 
 	writeJSON(w, http.StatusOK, &appPostRideEvaluationResponse{
 		CompletedAt: ride.UpdatedAt.UnixMilli(),
@@ -659,6 +677,95 @@ type appGetNotificationResponseChairStats struct {
 	TotalEvaluationAvg float64 `json:"total_evaluation_avg"`
 }
 
+// appNotificationPayload is the data half of a notification response,
+// shared between the JSON-polling and SSE handlers so both build it via
+// the exact same queries. yetSentStatusID is "" when there is nothing
+// pending to mark as sent (the caller is looking at the plain latest
+// status instead).
+type appNotificationPayload struct {
+	data            *appGetNotificationResponseData
+	yetSentStatusID string
+}
+
+// buildAppNotificationPayload fetches the user's current ride (if any) and
+// the data to report for it, without mutating send-bookkeeping. Returns
+// (nil, nil) if the user has no ride at all yet.
+func buildAppNotificationPayload(ctx context.Context, tx *sqlx.Tx, user *User) (*appNotificationPayload, error) {
+	ride := &Ride{}
+	if err := tx.GetContext(ctx, ride, `/* api:appGetNotification route:GET /api/app/notification */
+SELECT * FROM rides WHERE user_id = ? ORDER BY created_at DESC LIMIT 1`, user.ID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	yetSentRideStatus := RideStatus{}
+	status := ""
+	if err := tx.GetContext(ctx, &yetSentRideStatus, `/* api:appGetNotification route:GET /api/app/notification */
+SELECT * FROM ride_statuses WHERE ride_id = ? AND app_sent_at IS NULL ORDER BY created_at ASC LIMIT 1`, ride.ID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			status, err = getLatestRideStatus(ctx, tx, ride.ID)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			return nil, err
+		}
+	} else {
+		status = yetSentRideStatus.Status
+	}
+
+	fare, err := calculateDiscountedFare(ctx, tx, user.ID, ride, ride.PickupLatitude, ride.PickupLongitude, ride.DestinationLatitude, ride.DestinationLongitude)
+	if err != nil {
+		return nil, err
+	}
+
+	data := &appGetNotificationResponseData{
+		RideID: ride.ID,
+		PickupCoordinate: Coordinate{
+			Latitude:  ride.PickupLatitude,
+			Longitude: ride.PickupLongitude,
+		},
+		DestinationCoordinate: Coordinate{
+			Latitude:  ride.DestinationLatitude,
+			Longitude: ride.DestinationLongitude,
+		},
+		Fare:      fare,
+		Status:    status,
+		CreatedAt: ride.CreatedAt.UnixMilli(),
+		UpdateAt:  ride.UpdatedAt.UnixMilli(),
+	}
+
+	if ride.ChairID.Valid {
+		chair := &Chair{}
+		if err := tx.GetContext(ctx, chair, `/* api:appGetNotification route:GET /api/app/notification */
+SELECT * FROM chairs WHERE id = ?`, ride.ChairID); err != nil {
+			return nil, err
+		}
+
+		stats, err := getChairStats(ctx, tx, chair.ID)
+		if err != nil {
+			return nil, err
+		}
+
+		data.Chair = &appGetNotificationResponseChair{
+			ID:    chair.ID,
+			Name:  chair.Name,
+			Model: chair.Model,
+			Stats: stats,
+		}
+	}
+
+	return &appNotificationPayload{data: data, yetSentStatusID: yetSentRideStatus.ID}, nil
+}
+
+func markAppStatusSent(ctx context.Context, tx *sqlx.Tx, yetSentStatusID string) error {
+	_, err := tx.ExecContext(ctx, `/* api:appGetNotification route:GET /api/app/notification */
+UPDATE ride_statuses SET app_sent_at = CURRENT_TIMESTAMP(6) WHERE id = ?`, yetSentStatusID)
+	return err
+}
+
 func appGetNotification(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	user := ctx.Value("user").(*User)
@@ -670,91 +777,25 @@ func appGetNotification(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
-	ride := &Ride{}
-	if err := tx.GetContext(ctx, ride, `/* api:appGetNotification route:GET /api/app/notification */
-SELECT * FROM rides WHERE user_id = ? ORDER BY created_at DESC LIMIT 1`, user.ID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			writeJSON(w, http.StatusOK, &appGetNotificationResponse{
-				RetryAfterMs: notificationRetryAfterMsIdle,
-			})
-			return
-		}
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-
-	yetSentRideStatus := RideStatus{}
-	status := ""
-	if err := tx.GetContext(ctx, &yetSentRideStatus, `/* api:appGetNotification route:GET /api/app/notification */
-SELECT * FROM ride_statuses WHERE ride_id = ? AND app_sent_at IS NULL ORDER BY created_at ASC LIMIT 1`, ride.ID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			status, err = getLatestRideStatus(ctx, tx, ride.ID)
-			if err != nil {
-				writeError(w, http.StatusInternalServerError, err)
-				return
-			}
-		} else {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-	} else {
-		status = yetSentRideStatus.Status
-	}
-
-	fare, err := calculateDiscountedFare(ctx, tx, user.ID, ride, ride.PickupLatitude, ride.PickupLongitude, ride.DestinationLatitude, ride.DestinationLongitude)
+	payload, err := buildAppNotificationPayload(ctx, tx, user)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if payload == nil {
+		writeJSON(w, http.StatusOK, &appGetNotificationResponse{
+			RetryAfterMs: notificationRetryAfterMsIdle,
+		})
+		return
+	}
 
 	response := &appGetNotificationResponse{
-		Data: &appGetNotificationResponseData{
-			RideID: ride.ID,
-			PickupCoordinate: Coordinate{
-				Latitude:  ride.PickupLatitude,
-				Longitude: ride.PickupLongitude,
-			},
-			DestinationCoordinate: Coordinate{
-				Latitude:  ride.DestinationLatitude,
-				Longitude: ride.DestinationLongitude,
-			},
-			Fare:      fare,
-			Status:    status,
-			CreatedAt: ride.CreatedAt.UnixMilli(),
-			UpdateAt:  ride.UpdatedAt.UnixMilli(),
-		},
+		Data:         payload.data,
 		RetryAfterMs: notificationRetryAfterMsIdle,
 	}
-	if yetSentRideStatus.ID != "" {
+	if payload.yetSentStatusID != "" {
 		response.RetryAfterMs = notificationRetryAfterMsPending
-	}
-
-	if ride.ChairID.Valid {
-		chair := &Chair{}
-		if err := tx.GetContext(ctx, chair, `/* api:appGetNotification route:GET /api/app/notification */
-SELECT * FROM chairs WHERE id = ?`, ride.ChairID); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-
-		stats, err := getChairStats(ctx, tx, chair.ID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-
-		response.Data.Chair = &appGetNotificationResponseChair{
-			ID:    chair.ID,
-			Name:  chair.Name,
-			Model: chair.Model,
-			Stats: stats,
-		}
-	}
-
-	if yetSentRideStatus.ID != "" {
-		_, err := tx.ExecContext(ctx, `/* api:appGetNotification route:GET /api/app/notification */
-UPDATE ride_statuses SET app_sent_at = CURRENT_TIMESTAMP(6) WHERE id = ?`, yetSentRideStatus.ID)
-		if err != nil {
+		if err := markAppStatusSent(ctx, tx, payload.yetSentStatusID); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
@@ -766,6 +807,129 @@ UPDATE ride_statuses SET app_sent_at = CURRENT_TIMESTAMP(6) WHERE id = ?`, yetSe
 	}
 
 	writeJSON(w, http.StatusOK, response)
+}
+
+// appGetNotificationSSE is the SSE implementation of the same endpoint (see
+// isucon14/docs/ISURIDE.md's "通知エンドポイント" section: the reference
+// JSON-polling behavior and an SSE implementation are both explicitly
+// sanctioned, chosen by the server). It replaces the client-driven polling
+// loop with one long-lived connection per user, pushed to via an in-process
+// broadcaster (notify.go) instead of a fixed poll interval -- eliminating
+// the repeated HTTP request overhead (and, more importantly, the DB query
+// volume) polling was costing at high frequency.
+//
+// Delivery semantics are unchanged from the JSON path: every status
+// transition is still recorded via the same app_sent_at bookkeeping and
+// delivered at-least-once, in order. A duplicate delivery of the
+// just-connected ride's current status alongside its first still-pending
+// row (see below) is intentional and spec-compliant ("at least once", not
+// "exactly once").
+func appGetNotificationSSE(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	user := ctx.Value("user").(*User)
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, errors.New("streaming not supported"))
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	for {
+		payload, err := fetchAppNotificationPayload(ctx, user)
+		if err != nil {
+			if isIgnorableSSEError(err) {
+				return
+			}
+			slog.Error("appGetNotificationSSE: failed to build payload", "err", err)
+			return
+		}
+		if payload == nil {
+			// No ride yet: wait for one to be created for this user.
+			if !sseWait(ctx, userEvents.wait(user.ID)) {
+				return
+			}
+			continue
+		}
+
+		// Always send the current snapshot immediately upon (re)acquiring
+		// a ride -- required even if nothing is technically "pending"
+		// (e.g. a reconnect after everything was already marked sent).
+		if !writeSSEData(w, flusher, payload.data) {
+			return
+		}
+		if payload.yetSentStatusID != "" {
+			if err := markAppStatusSentStandalone(ctx, payload.yetSentStatusID); err != nil {
+				if isIgnorableSSEError(err) {
+					return
+				}
+				slog.Error("appGetNotificationSSE: failed to mark status sent", "err", err)
+				return
+			}
+		}
+
+		// Drain any further already-pending transitions before waiting.
+		for {
+			payload, err := fetchAppNotificationPayload(ctx, user)
+			if err != nil {
+				if isIgnorableSSEError(err) {
+					return
+				}
+				slog.Error("appGetNotificationSSE: failed to build payload", "err", err)
+				return
+			}
+			if payload == nil || payload.yetSentStatusID == "" {
+				break
+			}
+			if !writeSSEData(w, flusher, payload.data) {
+				return
+			}
+			if err := markAppStatusSentStandalone(ctx, payload.yetSentStatusID); err != nil {
+				if isIgnorableSSEError(err) {
+					return
+				}
+				slog.Error("appGetNotificationSSE: failed to mark status sent", "err", err)
+				return
+			}
+		}
+
+		if !sseWait(ctx, rideEvents.wait(payload.data.RideID)) {
+			return
+		}
+	}
+}
+
+func fetchAppNotificationPayload(ctx context.Context, user *User) (*appNotificationPayload, error) {
+	tx, err := db.Beginx()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	payload, err := buildAppNotificationPayload(ctx, tx, user)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+func markAppStatusSentStandalone(ctx context.Context, yetSentStatusID string) error {
+	tx, err := db.Beginx()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := markAppStatusSent(ctx, tx, yetSentStatusID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func getChairStats(ctx context.Context, tx *sqlx.Tx, chairID string) (appGetNotificationResponseChairStats, error) {

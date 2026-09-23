@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 
+	"github.com/jmoiron/sqlx"
 	"github.com/oklog/ulid/v2"
 )
 
@@ -153,6 +156,7 @@ WHERE id = ?`, addedDistance, recordedAt, req.Latitude, req.Longitude, chair.ID)
 	}
 
 	ride := &Ride{}
+	rideStatusChanged := false
 	if err := tx.GetContext(ctx, ride, `/* api:chairPostCoordinate route:POST /api/chair/coordinate */
 SELECT * FROM rides WHERE chair_id = ? ORDER BY updated_at DESC LIMIT 1`, chair.ID); err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
@@ -171,6 +175,7 @@ SELECT * FROM rides WHERE chair_id = ? ORDER BY updated_at DESC LIMIT 1`, chair.
 					writeError(w, http.StatusInternalServerError, err)
 					return
 				}
+				rideStatusChanged = true
 			}
 
 			if req.Latitude == ride.DestinationLatitude && req.Longitude == ride.DestinationLongitude && status == "CARRYING" {
@@ -178,6 +183,7 @@ SELECT * FROM rides WHERE chair_id = ? ORDER BY updated_at DESC LIMIT 1`, chair.
 					writeError(w, http.StatusInternalServerError, err)
 					return
 				}
+				rideStatusChanged = true
 			}
 		}
 	}
@@ -185,6 +191,9 @@ SELECT * FROM rides WHERE chair_id = ? ORDER BY updated_at DESC LIMIT 1`, chair.
 	if err := tx.Commit(); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	if rideStatusChanged {
+		rideEvents.publish(ride.ID)
 	}
 
 	writeJSON(w, http.StatusOK, &chairPostCoordinateResponse{
@@ -235,6 +244,86 @@ type chairGetNotificationResponseData struct {
 	Status                string     `json:"status"`
 }
 
+// chairNotificationPayload mirrors appNotificationPayload for the chair
+// side; see its doc comment.
+type chairNotificationPayload struct {
+	data            *chairGetNotificationResponseData
+	yetSentStatusID string
+}
+
+// buildChairNotificationPayload fetches the chair's current ride (if any)
+// and the data to report for it, without mutating send-bookkeeping.
+// Returns (nil, nil) if the chair has no ride at all yet.
+func buildChairNotificationPayload(ctx context.Context, tx *sqlx.Tx, chair *Chair) (*chairNotificationPayload, error) {
+	ride := &Ride{}
+	if err := tx.GetContext(ctx, ride, `/* api:chairGetNotification route:GET /api/chair/notification */
+SELECT * FROM rides WHERE chair_id = ? ORDER BY updated_at DESC LIMIT 1`, chair.ID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	yetSentRideStatus := RideStatus{}
+	status := ""
+	if err := tx.GetContext(ctx, &yetSentRideStatus, `/* api:chairGetNotification route:GET /api/chair/notification */
+SELECT * FROM ride_statuses WHERE ride_id = ? AND chair_sent_at IS NULL ORDER BY created_at ASC LIMIT 1`, ride.ID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			status, err = getLatestRideStatus(ctx, tx, ride.ID)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			return nil, err
+		}
+	} else {
+		status = yetSentRideStatus.Status
+	}
+
+	user := &User{}
+	if err := tx.GetContext(ctx, user, "/* api:chairGetNotification route:GET /api/chair/notification */ SELECT * FROM users WHERE id = ? FOR SHARE", ride.UserID); err != nil {
+		return nil, err
+	}
+
+	data := &chairGetNotificationResponseData{
+		RideID: ride.ID,
+		User: simpleUser{
+			ID:   user.ID,
+			Name: fmt.Sprintf("%s %s", user.Firstname, user.Lastname),
+		},
+		PickupCoordinate: Coordinate{
+			Latitude:  ride.PickupLatitude,
+			Longitude: ride.PickupLongitude,
+		},
+		DestinationCoordinate: Coordinate{
+			Latitude:  ride.DestinationLatitude,
+			Longitude: ride.DestinationLongitude,
+		},
+		Status: status,
+	}
+
+	return &chairNotificationPayload{data: data, yetSentStatusID: yetSentRideStatus.ID}, nil
+}
+
+// markChairStatusSent marks the given ride_statuses row as delivered to
+// the chair and, if it was the COMPLETED transition, frees the chair for
+// rematching. See the CODE=15 fix history: only COMPLETED may flip
+// is_free, and only once actually delivered, or a chair could be
+// rematched mid-ride.
+func markChairStatusSent(ctx context.Context, tx *sqlx.Tx, chairID, yetSentStatusID, yetSentStatus string) error {
+	if _, err := tx.ExecContext(ctx, `/* api:chairGetNotification route:GET /api/chair/notification */
+UPDATE ride_statuses SET chair_sent_at = CURRENT_TIMESTAMP(6) WHERE id = ?`, yetSentStatusID); err != nil {
+		return err
+	}
+	if yetSentStatus == "COMPLETED" {
+		if _, err := tx.ExecContext(ctx, `/* api:chairGetNotification route:GET /api/chair/notification */
+UPDATE chairs SET is_free = TRUE, updated_at = updated_at WHERE id = ?`, chairID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func chairGetNotification(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	chair := ctx.Value("chair").(*Chair)
@@ -245,64 +334,25 @@ func chairGetNotification(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback()
-	ride := &Ride{}
-	yetSentRideStatus := RideStatus{}
-	status := ""
 
-	if err := tx.GetContext(ctx, ride, `/* api:chairGetNotification route:GET /api/chair/notification */
-SELECT * FROM rides WHERE chair_id = ? ORDER BY updated_at DESC LIMIT 1`, chair.ID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			writeJSON(w, http.StatusOK, &chairGetNotificationResponse{
-				RetryAfterMs: notificationRetryAfterMsIdle,
-			})
-			return
-		}
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-
-	if err := tx.GetContext(ctx, &yetSentRideStatus, `/* api:chairGetNotification route:GET /api/chair/notification */
-SELECT * FROM ride_statuses WHERE ride_id = ? AND chair_sent_at IS NULL ORDER BY created_at ASC LIMIT 1`, ride.ID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			status, err = getLatestRideStatus(ctx, tx, ride.ID)
-			if err != nil {
-				writeError(w, http.StatusInternalServerError, err)
-				return
-			}
-		} else {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-	} else {
-		status = yetSentRideStatus.Status
-	}
-
-	user := &User{}
-	err = tx.GetContext(ctx, user, "/* api:chairGetNotification route:GET /api/chair/notification */ SELECT * FROM users WHERE id = ? FOR SHARE", ride.UserID)
+	payload, err := buildChairNotificationPayload(ctx, tx, chair)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if payload == nil {
+		writeJSON(w, http.StatusOK, &chairGetNotificationResponse{
+			RetryAfterMs: notificationRetryAfterMsIdle,
+		})
+		return
+	}
 
-	if yetSentRideStatus.ID != "" {
-		_, err := tx.ExecContext(ctx, `/* api:chairGetNotification route:GET /api/chair/notification */
-UPDATE ride_statuses SET chair_sent_at = CURRENT_TIMESTAMP(6) WHERE id = ?`, yetSentRideStatus.ID)
-		if err != nil {
+	retryAfterMs := notificationRetryAfterMsIdle
+	if payload.yetSentStatusID != "" {
+		retryAfterMs = notificationRetryAfterMsPending
+		if err := markChairStatusSent(ctx, tx, chair.ID, payload.yetSentStatusID, payload.data.Status); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
-		}
-
-		// Only the COMPLETED transition frees the chair for rematching —
-		// every other status (MATCHING/ENROUTE/PICKUP/CARRYING/ARRIVED)
-		// must NOT flip this, or a chair could be rematched mid-ride,
-		// double-booking it. This is the write-side half of the is_free
-		// flag matchOneRide reads instead of a correlated NOT EXISTS scan.
-		if yetSentRideStatus.Status == "COMPLETED" {
-			if _, err := tx.ExecContext(ctx, `/* api:chairGetNotification route:GET /api/chair/notification */
-UPDATE chairs SET is_free = TRUE, updated_at = updated_at WHERE id = ?`, chair.ID); err != nil {
-				writeError(w, http.StatusInternalServerError, err)
-				return
-			}
 		}
 	}
 
@@ -311,30 +361,118 @@ UPDATE chairs SET is_free = TRUE, updated_at = updated_at WHERE id = ?`, chair.I
 		return
 	}
 
-	retryAfterMs := notificationRetryAfterMsIdle
-	if yetSentRideStatus.ID != "" {
-		retryAfterMs = notificationRetryAfterMsPending
-	}
-
 	writeJSON(w, http.StatusOK, &chairGetNotificationResponse{
-		Data: &chairGetNotificationResponseData{
-			RideID: ride.ID,
-			User: simpleUser{
-				ID:   user.ID,
-				Name: fmt.Sprintf("%s %s", user.Firstname, user.Lastname),
-			},
-			PickupCoordinate: Coordinate{
-				Latitude:  ride.PickupLatitude,
-				Longitude: ride.PickupLongitude,
-			},
-			DestinationCoordinate: Coordinate{
-				Latitude:  ride.DestinationLatitude,
-				Longitude: ride.DestinationLongitude,
-			},
-			Status: status,
-		},
+		Data:         payload.data,
 		RetryAfterMs: retryAfterMs,
 	})
+}
+
+// chairGetNotificationSSE is the SSE counterpart of chairGetNotification;
+// see appGetNotificationSSE's doc comment for the shared design rationale
+// (in-process broadcaster instead of client-driven polling, same
+// at-least-once/in-order delivery semantics via the same send-bookkeeping).
+func chairGetNotificationSSE(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	chair := ctx.Value("chair").(*Chair)
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, errors.New("streaming not supported"))
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	for {
+		payload, err := fetchChairNotificationPayload(ctx, chair)
+		if err != nil {
+			if isIgnorableSSEError(err) {
+				return
+			}
+			slog.Error("chairGetNotificationSSE: failed to build payload", "err", err)
+			return
+		}
+		if payload == nil {
+			// No ride yet: wait for one to be matched to this chair.
+			if !sseWait(ctx, chairEvents.wait(chair.ID)) {
+				return
+			}
+			continue
+		}
+
+		if !writeSSEData(w, flusher, payload.data) {
+			return
+		}
+		if payload.yetSentStatusID != "" {
+			if err := markChairStatusSentStandalone(ctx, chair.ID, payload.yetSentStatusID, payload.data.Status); err != nil {
+				if isIgnorableSSEError(err) {
+					return
+				}
+				slog.Error("chairGetNotificationSSE: failed to mark status sent", "err", err)
+				return
+			}
+		}
+
+		for {
+			payload, err := fetchChairNotificationPayload(ctx, chair)
+			if err != nil {
+				if isIgnorableSSEError(err) {
+					return
+				}
+				slog.Error("chairGetNotificationSSE: failed to build payload", "err", err)
+				return
+			}
+			if payload == nil || payload.yetSentStatusID == "" {
+				break
+			}
+			if !writeSSEData(w, flusher, payload.data) {
+				return
+			}
+			if err := markChairStatusSentStandalone(ctx, chair.ID, payload.yetSentStatusID, payload.data.Status); err != nil {
+				if isIgnorableSSEError(err) {
+					return
+				}
+				slog.Error("chairGetNotificationSSE: failed to mark status sent", "err", err)
+				return
+			}
+		}
+
+		if !sseWait(ctx, rideEvents.wait(payload.data.RideID)) {
+			return
+		}
+	}
+}
+
+func fetchChairNotificationPayload(ctx context.Context, chair *Chair) (*chairNotificationPayload, error) {
+	tx, err := db.Beginx()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	payload, err := buildChairNotificationPayload(ctx, tx, chair)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+func markChairStatusSentStandalone(ctx context.Context, chairID, yetSentStatusID, yetSentStatus string) error {
+	tx, err := db.Beginx()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := markChairStatusSent(ctx, tx, chairID, yetSentStatusID, yetSentStatus); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 type postChairRidesRideIDStatusRequest struct {
@@ -405,6 +543,7 @@ func chairPostRideStatus(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	rideEvents.publish(ride.ID)
 
 	w.WriteHeader(http.StatusNoContent)
 }
