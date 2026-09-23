@@ -2,62 +2,73 @@ package main
 
 import (
 	"context"
-	"database/sql"
-	"errors"
 	"net/http"
+	"sort"
 )
 
 // このAPIをインスタンス内から一定間隔で叩かせることで、椅子とライドをマッチングさせる
 //
-// A prior attempt looped this up to 20 times per call and caused a
-// catastrophic system-wide overload (many unrelated error categories,
-// benchmark abort) rather than just fixing matching latency — the fixed
-// one-match-per-tick rate was apparently also implicitly throttling total
-// concurrent active-ride load, not only matching speed. This is a much
-// smaller step (3x instead of 20x) to increase throughput gradually and
-// re-measure, rather than assuming more headroom is always better. The
-// matching logic itself — selection order, chair-freeness check — is
-// unchanged; this only repeats it, still strictly sequentially within one
-// goroutine, so it introduces no new concurrency or race window.
-const maxMatchesPerCall = 3
+// History:
+//   - A prior attempt looped a single-ride-per-transaction match up to 20
+//     times per call and caused a catastrophic system-wide overload (many
+//     unrelated error categories, benchmark abort). A much smaller step
+//     (1->3x) fixed throughput safely.
+//   - This version replaces the per-ride-transaction loop with one batch
+//     match per tick: fetch up to maxMatchesPerCall pending rides and all
+//     free chairs in two SELECTs, compute assignments in Go, and apply them
+//     in a single transaction. This cuts round trips from up to
+//     3*(1 SELECT ride + 1 SELECT chair + 2 UPDATE) down to a fixed 2
+//     SELECTs + up to 2*N UPDATEs per tick.
+//   - maxMatchesPerCall is deliberately still a hard cap (not "drain the
+//     whole backlog"): an App Understanding Agent review of this change
+//     flagged that per-tick batch size is a load-bearing rate limiter for
+//     the whole system (per the 1->3-safe / 1->20-catastrophic history
+//     above), and that uncapping it would let query/compute cost scale with
+//     backlog size exactly when the backlog — and CODE=32 risk — is
+//     largest. The ride SELECT itself is bounded by this same constant via
+//     LIMIT, so cost during a backlog episode stays flat instead of
+//     growing with the backlog. Raise this only in small steps (e.g.
+//     10->30), benchmarking after each step, the same way 3 was validated.
+const maxMatchesPerCall = 10
+
+// freeChairCandidate is a free chair joined with its model's speed, used to
+// replicate the matching cost formula in Go.
+type freeChairCandidate struct {
+	Chair
+	Speed int `db:"speed"`
+}
 
 func internalGetMatching(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	for i := 0; i < maxMatchesPerCall; i++ {
-		matched, err := matchOneRide(ctx)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		if !matched {
-			break
-		}
+	if err := matchPendingRides(ctx); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
-
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// matchOneRide finds the single oldest unmatched ride and the single best
-// free chair for it, and assigns them. Returns (false, nil) if there is no
-// unmatched ride or no free chair available right now.
-func matchOneRide(ctx context.Context) (bool, error) {
+// matchPendingRides fetches up to maxMatchesPerCall oldest unmatched rides
+// and all currently free chairs, greedily assigns each ride (oldest first)
+// to its best remaining chair using the same cost formula and tie-break the
+// previous single-match SQL used, and commits all resulting assignments in
+// one transaction.
+func matchPendingRides(ctx context.Context) error {
 	tx, err := db.Beginx()
 	if err != nil {
-		return false, err
+		return err
 	}
 	defer tx.Rollback()
 
 	// MEMO: 一旦最も待たせているリクエストに適当な空いている椅子マッチさせる実装とする。おそらくもっといい方法があるはず…
-	ride := &Ride{}
-	if err := tx.GetContext(ctx, ride, `/* api:internalGetMatching route:GET /api/internal/matching */
-SELECT * FROM rides WHERE chair_id IS NULL ORDER BY created_at LIMIT 1`); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return false, nil
-		}
-		return false, err
+	rides := []Ride{}
+	if err := tx.SelectContext(ctx, &rides, `/* api:internalGetMatching route:GET /api/internal/matching */
+SELECT * FROM rides WHERE chair_id IS NULL ORDER BY created_at ASC LIMIT ?`, maxMatchesPerCall); err != nil {
+		return err
+	}
+	if len(rides) == 0 {
+		return nil
 	}
 
-	matched := &Chair{}
 	// Reads chairs.latest_latitude/longitude (denormalized onto the chairs
 	// row by chairPostCoordinate) instead of recomputing "latest location
 	// per chair" via a MAX(created_at)-per-chair derived table on every
@@ -71,33 +82,72 @@ SELECT * FROM rides WHERE chair_id IS NULL ORDER BY created_at LIMIT 1`); err !=
 	// being delivered to the chair (chair_sent_at set) — preserving the
 	// same "notification-delivered before rematch" invariant the old
 	// NOT EXISTS query enforced (see CODE=15 fix history).
-	if err := tx.GetContext(ctx, matched, `/* api:internalGetMatching route:GET /api/internal/matching */
-SELECT chairs.*
+	//
+	// Not LIMITed: free-chair count is bounded by total fleet size, which
+	// stays small regardless of ride backlog, so this query's cost doesn't
+	// grow during a backlog episode the way an unbounded ride SELECT would.
+	available := []freeChairCandidate{}
+	if err := tx.SelectContext(ctx, &available, `/* api:internalGetMatching route:GET /api/internal/matching */
+SELECT chairs.*, chair_models.speed AS speed
 FROM chairs
        INNER JOIN chair_models ON chair_models.name = chairs.model
 WHERE chairs.is_active = TRUE
   AND chairs.latest_latitude IS NOT NULL
-  AND chairs.is_free = TRUE
-ORDER BY (ABS(chairs.latest_latitude - ?) + ABS(chairs.latest_longitude - ?)) / chair_models.speed ASC,
-         chairs.updated_at ASC
-LIMIT 1`, ride.PickupLatitude, ride.PickupLongitude); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return false, nil
+  AND chairs.is_free = TRUE`); err != nil {
+		return err
+	}
+
+	type assignment struct {
+		rideID  string
+		chairID string
+	}
+	assignments := make([]assignment, 0, len(rides))
+
+	// For each ride (oldest first), pick the best remaining chair by the
+	// same (distance/speed ASC, chair.updated_at ASC) ordering the original
+	// single-match SQL used, then remove it from the pool. Re-sorting the
+	// whole remaining slice per ride (rather than a running-min scan) avoids
+	// float tie-break subtleties and exactly replicates "ORDER BY ... LIMIT
+	// 1" semantics; with maxMatchesPerCall capped at 10 and fleet size small,
+	// this is negligible CPU cost.
+	for _, ride := range rides {
+		if len(available) == 0 {
+			break
 		}
-		return false, err
+
+		sort.SliceStable(available, func(i, j int) bool {
+			ci := matchCost(available[i], ride)
+			cj := matchCost(available[j], ride)
+			if ci != cj {
+				return ci < cj
+			}
+			return available[i].UpdatedAt.Before(available[j].UpdatedAt)
+		})
+
+		chosen := available[0]
+		available = available[1:]
+		assignments = append(assignments, assignment{rideID: ride.ID, chairID: chosen.ID})
 	}
 
-	if _, err := tx.ExecContext(ctx, "UPDATE rides SET chair_id = ? WHERE id = ?", matched.ID, ride.ID); err != nil {
-		return false, err
+	if len(assignments) == 0 {
+		return nil
 	}
 
-	if _, err := tx.ExecContext(ctx, "UPDATE chairs SET is_free = FALSE, updated_at = updated_at WHERE id = ?", matched.ID); err != nil {
-		return false, err
+	for _, a := range assignments {
+		if _, err := tx.ExecContext(ctx, "UPDATE rides SET chair_id = ? WHERE id = ?", a.chairID, a.rideID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, "UPDATE chairs SET is_free = FALSE, updated_at = updated_at WHERE id = ?", a.chairID); err != nil {
+			return err
+		}
 	}
 
-	if err := tx.Commit(); err != nil {
-		return false, err
-	}
+	return tx.Commit()
+}
 
-	return true, nil
+// matchCost replicates the original SQL's
+// (ABS(lat-?) + ABS(lon-?)) / speed ASC ordering.
+func matchCost(c freeChairCandidate, ride Ride) float64 {
+	dist := abs(int(c.LatestLatitude.Int64)-ride.PickupLatitude) + abs(int(c.LatestLongitude.Int64)-ride.PickupLongitude)
+	return float64(dist) / float64(c.Speed)
 }
