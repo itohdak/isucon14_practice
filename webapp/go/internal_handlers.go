@@ -41,9 +41,15 @@ func internalGetMatching(w http.ResponseWriter, r *http.Request) {
 // free chair for it, and assigns them. Returns (false, nil) if there is no
 // unmatched ride or no free chair available right now.
 func matchOneRide(ctx context.Context) (bool, error) {
+	tx, err := db.Beginx()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
 	// MEMO: 一旦最も待たせているリクエストに適当な空いている椅子マッチさせる実装とする。おそらくもっといい方法があるはず…
 	ride := &Ride{}
-	if err := db.GetContext(ctx, ride, `/* api:internalGetMatching route:GET /api/internal/matching */
+	if err := tx.GetContext(ctx, ride, `/* api:internalGetMatching route:GET /api/internal/matching */
 SELECT * FROM rides WHERE chair_id IS NULL ORDER BY created_at LIMIT 1`); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, nil
@@ -57,31 +63,21 @@ SELECT * FROM rides WHERE chair_id IS NULL ORDER BY created_at LIMIT 1`); err !=
 	// per chair" via a MAX(created_at)-per-chair derived table on every
 	// matching tick, which repeated the same O(active chairs) work every
 	// call — the same fix applied to appGetNearbyChairs for the same reason.
-	if err := db.GetContext(ctx, matched, `/* api:internalGetMatching route:GET /api/internal/matching */
+	//
+	// Also reads chairs.is_free instead of a correlated NOT EXISTS scan
+	// over the chair's full ride/status history. is_free is maintained
+	// transactionally: set FALSE right here on match, and set TRUE only in
+	// chairGetNotification when the COMPLETED status is the one actually
+	// being delivered to the chair (chair_sent_at set) — preserving the
+	// same "notification-delivered before rematch" invariant the old
+	// NOT EXISTS query enforced (see CODE=15 fix history).
+	if err := tx.GetContext(ctx, matched, `/* api:internalGetMatching route:GET /api/internal/matching */
 SELECT chairs.*
 FROM chairs
        INNER JOIN chair_models ON chair_models.name = chairs.model
 WHERE chairs.is_active = TRUE
   AND chairs.latest_latitude IS NOT NULL
-  -- A chair only counts as free once it has actually been sent the
-  -- COMPLETED status for every ride it was assigned (chair_sent_at set),
-  -- not merely once COMPLETED has been recorded. chairGetNotification
-  -- always reports on the chair's most-recently-updated ride, so
-  -- assigning a new ride the instant COMPLETED is recorded (but before
-  -- the chair has polled and seen it) would silently strand that
-  -- COMPLETED notification and violate at-least-once delivery.
-  AND NOT EXISTS (
-    SELECT 1
-    FROM rides assigned_rides
-    WHERE assigned_rides.chair_id = chairs.id
-      AND NOT EXISTS (
-        SELECT 1
-        FROM ride_statuses completed_statuses
-        WHERE completed_statuses.ride_id = assigned_rides.id
-          AND completed_statuses.status = 'COMPLETED'
-          AND completed_statuses.chair_sent_at IS NOT NULL
-      )
-  )
+  AND chairs.is_free = TRUE
 ORDER BY (ABS(chairs.latest_latitude - ?) + ABS(chairs.latest_longitude - ?)) / chair_models.speed ASC,
          chairs.updated_at ASC
 LIMIT 1`, ride.PickupLatitude, ride.PickupLongitude); err != nil {
@@ -91,7 +87,15 @@ LIMIT 1`, ride.PickupLatitude, ride.PickupLongitude); err != nil {
 		return false, err
 	}
 
-	if _, err := db.ExecContext(ctx, "UPDATE rides SET chair_id = ? WHERE id = ?", matched.ID, ride.ID); err != nil {
+	if _, err := tx.ExecContext(ctx, "UPDATE rides SET chair_id = ? WHERE id = ?", matched.ID, ride.ID); err != nil {
+		return false, err
+	}
+
+	if _, err := tx.ExecContext(ctx, "UPDATE chairs SET is_free = FALSE, updated_at = updated_at WHERE id = ?", matched.ID); err != nil {
+		return false, err
+	}
+
+	if err := tx.Commit(); err != nil {
 		return false, err
 	}
 

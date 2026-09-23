@@ -45,7 +45,15 @@ ALTER TABLE chairs
   ADD COLUMN total_distance INTEGER NOT NULL DEFAULT 0 COMMENT '累計移動距離',
   ADD COLUMN total_distance_updated_at DATETIME(6) NULL COMMENT '累計移動距離の最終更新日時',
   ADD COLUMN latest_latitude INTEGER NULL COMMENT '直近の緯度',
-  ADD COLUMN latest_longitude INTEGER NULL COMMENT '直近の経度';
+  ADD COLUMN latest_longitude INTEGER NULL COMMENT '直近の経度',
+  -- Denormalized "chair has no unfinished assigned ride" flag, maintained
+  -- transactionally by matchOneRide (set FALSE on match) and
+  -- chairGetNotification (set TRUE only when the COMPLETED status is the
+  -- one being delivered), instead of recomputed via a correlated NOT
+  -- EXISTS scan on every matching tick. Defaults to TRUE so a
+  -- newly-created chair (no assigned rides yet) is immediately
+  -- matchable, matching the old query's behavior.
+  ADD COLUMN is_free BOOLEAN NOT NULL DEFAULT TRUE COMMENT '新しいライドを受付可能か';
 
 UPDATE chairs
 LEFT JOIN (
@@ -73,4 +81,22 @@ SET chairs.total_distance = IFNULL(distance_table.total_distance, 0),
     chairs.latest_latitude = latest_location.latitude,
     chairs.latest_longitude = latest_location.longitude,
     chairs.updated_at = chairs.updated_at;
+
+-- One-time backfill using the exact same semantics as the NOT EXISTS
+-- query this flag replaces, so historical seed data (which may include
+-- pre-assigned rides) starts with a correct is_free value.
+UPDATE chairs
+SET is_free = NOT EXISTS (
+  SELECT 1
+  FROM rides assigned_rides
+  WHERE assigned_rides.chair_id = chairs.id
+    AND NOT EXISTS (
+      SELECT 1
+      FROM ride_statuses completed_statuses
+      WHERE completed_statuses.ride_id = assigned_rides.id
+        AND completed_statuses.status = 'COMPLETED'
+        AND completed_statuses.chair_sent_at IS NOT NULL
+    )
+),
+    updated_at = updated_at;
 SQL

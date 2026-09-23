@@ -18,6 +18,7 @@ type Chair struct {
 	TotalDistanceUpdatedAt sql.NullTime  `db:"total_distance_updated_at"`
 	LatestLatitude         sql.NullInt64 `db:"latest_latitude"`
 	LatestLongitude        sql.NullInt64 `db:"latest_longitude"`
+	IsFree                 bool          `db:"is_free"`
 }
 
 type ChairModel struct {

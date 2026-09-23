@@ -266,6 +266,19 @@ UPDATE ride_statuses SET chair_sent_at = CURRENT_TIMESTAMP(6) WHERE id = ?`, yet
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+
+		// Only the COMPLETED transition frees the chair for rematching —
+		// every other status (MATCHING/ENROUTE/PICKUP/CARRYING/ARRIVED)
+		// must NOT flip this, or a chair could be rematched mid-ride,
+		// double-booking it. This is the write-side half of the is_free
+		// flag matchOneRide reads instead of a correlated NOT EXISTS scan.
+		if yetSentRideStatus.Status == "COMPLETED" {
+			if _, err := tx.ExecContext(ctx, `/* api:chairGetNotification route:GET /api/chair/notification */
+UPDATE chairs SET is_free = TRUE, updated_at = updated_at WHERE id = ?`, chair.ID); err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
