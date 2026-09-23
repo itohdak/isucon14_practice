@@ -152,7 +152,7 @@ func collectPprotein() {
 
 	url := os.Getenv("PPROTEIN_COLLECT_URL")
 	if url == "" {
-		url = "http://s2:9000/api/group/collect"
+		url = "http://s3:9000/api/group/collect"
 	}
 
 	go func() {
