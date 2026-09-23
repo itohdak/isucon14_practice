@@ -202,15 +202,24 @@ type simpleUser struct {
 // quickly so it drains the queue promptly. When the client is fully caught
 // up (nothing pending), there is nothing to lose by waiting longer before
 // the next poll — this directly reduces notification-polling query volume,
-// which dominates total query count on these endpoints. Unlike server-side
-// rate limits (e.g. matcher batch size), raising the idle value can only
-// reduce load, not risk an overload — the tradeoff is purely score-side
-// (slower notice of a new event could reduce ride throughput), so this can
-// be tuned more directly via benchmarking than a load-bearing rate limit.
-// 100ms was the first step (confirmed a clean win); this raises it further.
+// which dominates total query count on these endpoints.
+//
+// 100ms is a confirmed-safe value (3/3 clean runs, new score highs). A
+// later attempt at 300ms caused CODE=32 ("ride not matched for a long
+// time") failures — this was NOT a load/overload effect; the working
+// theory is that the benchmark's simulated chair client couples its
+// notification-poll cadence to other client-side behavior (e.g. how often
+// it posts its coordinate), so a slower "no ride yet" poll response also
+// delayed that chair becoming matchable (matchOneRide requires
+// chairs.latest_latitude IS NOT NULL, which is only set once a coordinate
+// has been posted). Do not assume "longer idle retry_after_ms is
+// unconditionally safe because it can only reduce server load" — client
+// behavior can be coupled to this value in ways not visible from the
+// server code alone. Any further increase must be re-tested carefully,
+// in small steps, watching specifically for CODE=32.
 const (
 	notificationRetryAfterMsPending = 30
-	notificationRetryAfterMsIdle    = 300
+	notificationRetryAfterMsIdle    = 100
 )
 
 type chairGetNotificationResponse struct {
