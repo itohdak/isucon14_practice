@@ -26,7 +26,7 @@ user		= mysql
 # changed. Ref https://dev.mysql.com/doc/refman/8.0/en/server-system-variables.html#sysvar_tmpdir
 # tmpdir		= /tmp
 #
-# s3 is the dedicated DB host in the split topology, so it must accept
+# s2 is the dedicated DB host in the split topology, so it must accept
 # connections from the app host (s1) over the private network rather than
 # only from localhost. Access is still restricted at the network layer by
 # the security group, which only allows the 192.168.0.0/24 private subnet.
