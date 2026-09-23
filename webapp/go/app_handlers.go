@@ -675,7 +675,7 @@ func appGetNotification(w http.ResponseWriter, r *http.Request) {
 SELECT * FROM rides WHERE user_id = ? ORDER BY created_at DESC LIMIT 1`, user.ID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeJSON(w, http.StatusOK, &appGetNotificationResponse{
-				RetryAfterMs: 30,
+				RetryAfterMs: notificationRetryAfterMsIdle,
 			})
 			return
 		}
@@ -723,7 +723,10 @@ SELECT * FROM ride_statuses WHERE ride_id = ? AND app_sent_at IS NULL ORDER BY c
 			CreatedAt: ride.CreatedAt.UnixMilli(),
 			UpdateAt:  ride.UpdatedAt.UnixMilli(),
 		},
-		RetryAfterMs: 30,
+		RetryAfterMs: notificationRetryAfterMsIdle,
+	}
+	if yetSentRideStatus.ID != "" {
+		response.RetryAfterMs = notificationRetryAfterMsPending
 	}
 
 	if ride.ChairID.Valid {

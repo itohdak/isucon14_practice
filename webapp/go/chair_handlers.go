@@ -197,6 +197,20 @@ type simpleUser struct {
 	Name string `json:"name"`
 }
 
+// Poll interval hints for GET /api/{app,chair}/notification. When there is a
+// pending (not-yet-sent) status transition, tell the client to poll again
+// quickly so it drains the queue promptly. When the client is fully caught
+// up (nothing pending), there is nothing to lose by waiting longer before
+// the next poll — this directly reduces notification-polling query volume,
+// which dominates total query count on these endpoints. Kept modest (a
+// single small step, not a large jump) since slower notification delivery
+// could reduce ride throughput/score if pushed too far; increase further
+// only after benchmarking this step.
+const (
+	notificationRetryAfterMsPending = 30
+	notificationRetryAfterMsIdle    = 100
+)
+
 type chairGetNotificationResponse struct {
 	Data         *chairGetNotificationResponseData `json:"data"`
 	RetryAfterMs int                               `json:"retry_after_ms"`
@@ -228,7 +242,7 @@ func chairGetNotification(w http.ResponseWriter, r *http.Request) {
 SELECT * FROM rides WHERE chair_id = ? ORDER BY updated_at DESC LIMIT 1`, chair.ID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeJSON(w, http.StatusOK, &chairGetNotificationResponse{
-				RetryAfterMs: 30,
+				RetryAfterMs: notificationRetryAfterMsIdle,
 			})
 			return
 		}
@@ -286,6 +300,11 @@ UPDATE chairs SET is_free = TRUE, updated_at = updated_at WHERE id = ?`, chair.I
 		return
 	}
 
+	retryAfterMs := notificationRetryAfterMsIdle
+	if yetSentRideStatus.ID != "" {
+		retryAfterMs = notificationRetryAfterMsPending
+	}
+
 	writeJSON(w, http.StatusOK, &chairGetNotificationResponse{
 		Data: &chairGetNotificationResponseData{
 			RideID: ride.ID,
@@ -303,7 +322,7 @@ UPDATE chairs SET is_free = TRUE, updated_at = updated_at WHERE id = ?`, chair.I
 			},
 			Status: status,
 		},
-		RetryAfterMs: 30,
+		RetryAfterMs: retryAfterMs,
 	})
 }
 
