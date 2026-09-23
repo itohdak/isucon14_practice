@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"net/http"
-	"sort"
+	"time"
 )
 
 // このAPIをインスタンス内から一定間隔で叩かせることで、椅子とライドをマッチングさせる
@@ -47,11 +47,28 @@ func internalGetMatching(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// urgencyWeight scales how strongly a ride's wait time inflates its
+// effective pickup cost (see matchCost). At wait=0 it has no effect; at
+// wait=10s the effective cost is roughly doubled, at wait=30s roughly
+// quadrupled, biasing the optimizer to give long-waiting rides the best
+// available chair even at the expense of a fresher ride's pickup distance.
+// Chosen conservatively relative to observed pickupCost magnitudes (single
+// to low hundreds, given the ~400x400 coordinate grid and speed 2-7) so
+// fresh rides are barely affected. Tune in small steps like any other
+// matching parameter, watching specifically for CODE=32 (ride starvation)
+// if lowered, and for degraded pickup-distance score if raised too far.
+const urgencyWeight = 0.1
+
 // matchPendingRides fetches up to maxMatchesPerCall oldest unmatched rides
-// and all currently free chairs, greedily assigns each ride (oldest first)
-// to its best remaining chair using the same cost formula and tie-break the
-// previous single-match SQL used, and commits all resulting assignments in
-// one transaction.
+// and all currently free chairs, then computes the assignment that
+// minimizes total (urgency-weighted) pickup cost across the whole batch at
+// once via the Hungarian algorithm (see matching_assignment.go), rather
+// than a purely greedy oldest-ride-first pick. A pure greedy pick locks in
+// the oldest ride's single best chair unconditionally, which can force a
+// mediocre match onto the second-oldest ride even when swapping would have
+// been better overall; the urgency weighting in the cost function keeps
+// long-waiting rides protected without needing that hard sequential
+// priority. All resulting assignments are applied in one transaction.
 func matchPendingRides(ctx context.Context) error {
 	tx, err := db.Beginx()
 	if err != nil {
@@ -59,7 +76,6 @@ func matchPendingRides(ctx context.Context) error {
 	}
 	defer tx.Rollback()
 
-	// MEMO: 一旦最も待たせているリクエストに適当な空いている椅子マッチさせる実装とする。おそらくもっといい方法があるはず…
 	rides := []Ride{}
 	if err := tx.SelectContext(ctx, &rides, `/* api:internalGetMatching route:GET /api/internal/matching */
 SELECT * FROM rides WHERE chair_id IS NULL ORDER BY created_at ASC LIMIT ?`, maxMatchesPerCall); err != nil {
@@ -97,47 +113,33 @@ WHERE chairs.is_active = TRUE
 		return err
 	}
 
-	type assignment struct {
-		rideID  string
-		chairID string
+	// hungarianAssignment requires rows (rides) <= columns (chairs). When
+	// chairs are scarcer than fetched rides, keep only the oldest ones (the
+	// SELECT above already ordered by created_at ASC) rather than the
+	// algorithm's own cost-minimization deciding which rides go unmatched —
+	// oldest-first-when-scarce is the same anti-starvation priority this
+	// matcher has always used, and CODE=32 risk is exactly what's at stake
+	// when chairs are the scarce resource.
+	if len(available) < len(rides) {
+		rides = rides[:len(available)]
 	}
-	assignments := make([]assignment, 0, len(rides))
 
-	// For each ride (oldest first), pick the best remaining chair by the
-	// same (distance/speed ASC, chair.updated_at ASC) ordering the original
-	// single-match SQL used, then remove it from the pool. Re-sorting the
-	// whole remaining slice per ride (rather than a running-min scan) avoids
-	// float tie-break subtleties and exactly replicates "ORDER BY ... LIMIT
-	// 1" semantics; with maxMatchesPerCall capped at 10 and fleet size small,
-	// this is negligible CPU cost.
-	for _, ride := range rides {
-		if len(available) == 0 {
-			break
+	now := time.Now()
+	cost := make([][]float64, len(rides))
+	for i, ride := range rides {
+		cost[i] = make([]float64, len(available))
+		for j, chair := range available {
+			cost[i][j] = matchCost(chair, ride, now)
 		}
-
-		sort.SliceStable(available, func(i, j int) bool {
-			ci := matchCost(available[i], ride)
-			cj := matchCost(available[j], ride)
-			if ci != cj {
-				return ci < cj
-			}
-			return available[i].UpdatedAt.Before(available[j].UpdatedAt)
-		})
-
-		chosen := available[0]
-		available = available[1:]
-		assignments = append(assignments, assignment{rideID: ride.ID, chairID: chosen.ID})
 	}
+	assignment := hungarianAssignment(cost)
 
-	if len(assignments) == 0 {
-		return nil
-	}
-
-	for _, a := range assignments {
-		if _, err := tx.ExecContext(ctx, "UPDATE rides SET chair_id = ? WHERE id = ?", a.chairID, a.rideID); err != nil {
+	for i, ride := range rides {
+		chairID := available[assignment[i]].ID
+		if _, err := tx.ExecContext(ctx, "UPDATE rides SET chair_id = ? WHERE id = ?", chairID, ride.ID); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, "UPDATE chairs SET is_free = FALSE, updated_at = updated_at WHERE id = ?", a.chairID); err != nil {
+		if _, err := tx.ExecContext(ctx, "UPDATE chairs SET is_free = FALSE, updated_at = updated_at WHERE id = ?", chairID); err != nil {
 			return err
 		}
 	}
@@ -145,9 +147,15 @@ WHERE chairs.is_active = TRUE
 	return tx.Commit()
 }
 
-// matchCost replicates the original SQL's
-// (ABS(lat-?) + ABS(lon-?)) / speed ASC ordering.
-func matchCost(c freeChairCandidate, ride Ride) float64 {
+// matchCost is the original SQL's ABS(lat-?)+ABS(lon-?))/speed pickup-time
+// estimate, inflated by how long the ride has already been waiting — see
+// urgencyWeight's doc comment for why.
+func matchCost(c freeChairCandidate, ride Ride, now time.Time) float64 {
 	dist := abs(int(c.LatestLatitude.Int64)-ride.PickupLatitude) + abs(int(c.LatestLongitude.Int64)-ride.PickupLongitude)
-	return float64(dist) / float64(c.Speed)
+	pickupCost := float64(dist) / float64(c.Speed)
+	waitSeconds := now.Sub(ride.CreatedAt).Seconds()
+	if waitSeconds < 0 {
+		waitSeconds = 0
+	}
+	return pickupCost * (1 + urgencyWeight*waitSeconds)
 }
