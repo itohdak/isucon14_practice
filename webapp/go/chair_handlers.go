@@ -202,13 +202,15 @@ type simpleUser struct {
 // quickly so it drains the queue promptly. When the client is fully caught
 // up (nothing pending), there is nothing to lose by waiting longer before
 // the next poll — this directly reduces notification-polling query volume,
-// which dominates total query count on these endpoints. Kept modest (a
-// single small step, not a large jump) since slower notification delivery
-// could reduce ride throughput/score if pushed too far; increase further
-// only after benchmarking this step.
+// which dominates total query count on these endpoints. Unlike server-side
+// rate limits (e.g. matcher batch size), raising the idle value can only
+// reduce load, not risk an overload — the tradeoff is purely score-side
+// (slower notice of a new event could reduce ride throughput), so this can
+// be tuned more directly via benchmarking than a load-bearing rate limit.
+// 100ms was the first step (confirmed a clean win); this raises it further.
 const (
 	notificationRetryAfterMsPending = 30
-	notificationRetryAfterMsIdle    = 100
+	notificationRetryAfterMsIdle    = 300
 )
 
 type chairGetNotificationResponse struct {
